@@ -1,4 +1,4 @@
-import { ProviderPriceResult, ProviderRequest } from './index';
+import { ProviderPriceResult, ProviderRequest, PriceBreak } from './index';
 
 // Simple in-memory token cache
 let cachedToken: { token: string; expiresAt: number } | null = null;
@@ -49,15 +49,11 @@ async function getAccessToken(clientId: string, clientSecret: string): Promise<s
   return token;
 }
 
-export async function fetchDigiKeyPrice({ mpn, quantity, currency }: ProviderRequest): Promise<ProviderPriceResult> {
+export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPreference }: ProviderRequest): Promise<ProviderPriceResult> {
   const clientId = process.env.DIGIKEY_CLIENT_ID;
   const clientSecret = process.env.DIGIKEY_CLIENT_SECRET;
 
   const provider = "DigiKey";
-
-  // console.log(`[${provider}] ========================================`);
-  // console.log(`[${provider}] Fetching part: ${mpn}`);
-  // console.log(`[${provider}] Quantity: ${quantity}, Currency: ${currency}`);
 
   if (!clientId || !clientSecret) {
     console.error(`[${provider}] API credentials missing.`);
@@ -72,23 +68,17 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency }: ProviderReq
     const localeSite = currency === 'INR' ? 'IN' : currency === 'EUR' ? 'DE' : 'US';
     const localeLanguage = 'en';
 
-    // console.log(`[${provider}] Locale: Site=${localeSite}, Language=${localeLanguage}, Currency=${currency}`);
-
     // Step 3: Call V4 keyword search
     const useSandbox = process.env.DIGIKEY_USE_SANDBOX === 'true';
     const searchUrl = useSandbox
       ? 'https://sandbox-api.digikey.com/products/v4/search/keyword'
       : 'https://api.digikey.com/products/v4/search/keyword';
 
-    // console.log(`[${provider}] Search URL (${useSandbox ? 'SANDBOX' : 'PRODUCTION'}): ${searchUrl}`);
-
     const requestBody = {
       Keywords: mpn,
-      Limit: 1,
+      Limit: 5, // Increased to get packaging options and alternate parts
       Offset: 0,
     };
-
-    // console.log(`[${provider}] Request body:`, JSON.stringify(requestBody, null, 2));
 
     const res = await fetch(searchUrl, {
       method: 'POST',
@@ -105,8 +95,6 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency }: ProviderReq
       body: JSON.stringify(requestBody),
     });
 
-    // console.log(`[${provider}] Response status: ${res.status}`);
-
     if (!res.ok) {
       const errBody = await res.text();
       console.error(`[${provider}] API error response:`, errBody);
@@ -114,27 +102,50 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency }: ProviderReq
     }
 
     const data = await res.json();
-    // console.log(`[${provider}] Response data:`, JSON.stringify(data, null, 2));
+    
+    // Choose product based on packaging preference
+    let product = data?.Products?.[0];
+    let matchedProductIndex = 0;
 
-    // V4 response structure: data.Products is an array
-    const product = data?.Products?.[0];
+    if (Array.isArray(data?.Products) && data.Products.length > 1 && packagingPreference && packagingPreference !== 'Any') {
+      for (let i = 0; i < data.Products.length; i++) {
+        const prod = data.Products[i];
+        const packagingVal = String(prod.Packaging?.Value || prod.Packaging?.value || '').toLowerCase();
+        const descVal = String(prod.ProductDescription || prod.Description || '').toLowerCase();
+
+        const isReel = packagingVal.includes('reel') || packagingVal.includes('tr') || descVal.includes('tape & reel') || descVal.includes('reel');
+        const isCutTape = packagingVal.includes('cut tape') || packagingVal.includes('ct') || packagingVal.includes('strip') || packagingVal.includes('bag') || packagingVal.includes('tube') || packagingVal.includes('tray') || packagingVal.includes('bulk');
+
+        if (packagingPreference === 'Reel' && isReel) {
+          product = prod;
+          matchedProductIndex = i;
+          break;
+        } else if (packagingPreference === 'Cut Tape' && isCutTape) {
+          product = prod;
+          matchedProductIndex = i;
+          break;
+        }
+      }
+    }
 
     if (!product) {
-      // console.log(`[${provider}] Part not found in response`);
       return { provider, unitPrice: null, totalCost: null, availability: 0, error: "Part not found" };
     }
 
-    // console.log(`[${provider}] Product found: ${product.ManufacturerPartNumber || product.DigiKeyPartNumber}`);
-
-    // Extract unit price from the StandardPricing price breaks
-    let unitPrice = 0;
+    // Extract pricing details
     const priceBreaks = product?.StandardPricing || product?.ProductVariations?.[0]?.StandardPricing || [];
-    
-    // console.log(`[${provider}] Price breaks:`, JSON.stringify(priceBreaks, null, 2));
 
-    const moq = product.MinimumOrderQuantity || product.StandardPricing?.[0]?.BreakQuantity || 1;
+    const moq = product.MinimumOrderQuantity || 
+                product.MinimumOrderQty || 
+                product.MinOrderQuantity || 
+                product.StandardPricing?.[0]?.BreakQuantity || 
+                product.ProductVariations?.[0]?.MinimumOrderQuantity || 
+                product.ProductVariations?.[0]?.StandardPricing?.[0]?.BreakQuantity || 
+                1;
+
     const evalQty = Math.max(quantity, moq);
 
+    let unitPrice = 0;
     const sortedBreaks = [...priceBreaks].sort((a, b) => (a.BreakQuantity || 0) - (b.BreakQuantity || 0));
     for (const pb of sortedBreaks) {
       const breakQty = pb.BreakQuantity || 0;
@@ -143,24 +154,59 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency }: ProviderReq
         unitPrice = price;
       }
     }
+
     // Fallback: try UnitPrice directly on product
     if (unitPrice === 0 && product.UnitPrice) {
       unitPrice = product.UnitPrice;
-      // console.log(`[${provider}] Using direct UnitPrice: ${unitPrice}`);
     }
 
-    const availability = product.QuantityAvailable || product.QuantityOnHand || 0;
+    // Robust stock availability checking
+    const qtyAvailable = product.QuantityAvailable !== undefined ? product.QuantityAvailable : null;
+    const qtyOnHand = product.QuantityOnHand !== undefined ? product.QuantityOnHand : null;
+    
+    let availability = 0;
+    if (qtyAvailable !== null && qtyAvailable > 0) {
+      availability = qtyAvailable;
+    } else if (qtyAvailable === 0) {
+      availability = 0;
+    } else if (qtyOnHand !== null && qtyOnHand > 0) {
+      availability = qtyOnHand;
+    }
 
-    // console.log(`[${provider}] Final result: unitPrice=${unitPrice}, totalCost=${unitPrice * quantity}, availability=${availability}`);
-    // console.log(`[${provider}] ========================================`);
+    // Map all price breaks
+    const mappedBreaks: PriceBreak[] = priceBreaks.map((pb: any) => ({
+      quantity: pb.BreakQuantity || pb.breakQuantity || 0,
+      price: pb.UnitPrice || pb.unitPrice || 0
+    })).filter((b: any) => b.quantity > 0 && b.price > 0);
 
-
-    const alternateParts: string[] = [];
-    if (Array.isArray(product.AlternatePackaging)) {
+    // Dynamic alias parts gathering
+    const alternatePartsSet = new Set<string>();
+    
+    // 1. Matched product's alternate packaging
+    if (product.AlternatePackaging && Array.isArray(product.AlternatePackaging)) {
       product.AlternatePackaging.forEach((ap: any) => {
-        if (ap.ManufacturerPartNumber) alternateParts.push(ap.ManufacturerPartNumber);
+        const altMpn = ap.ManufacturerPartNumber || ap.manufacturerPartNumber;
+        if (altMpn && altMpn.trim() !== product.ManufacturerPartNumber?.trim()) {
+          alternatePartsSet.add(altMpn.trim());
+        }
       });
     }
+
+    // 2. Other product MPNs returned in search
+    if (Array.isArray(data?.Products)) {
+      data.Products.forEach((prod: any, idx: number) => {
+        if (idx !== matchedProductIndex) {
+          const altMpn = prod.ManufacturerPartNumber || prod.manufacturerPartNumber;
+          if (altMpn && altMpn.trim() !== product.ManufacturerPartNumber?.trim()) {
+            alternatePartsSet.add(altMpn.trim());
+          }
+        }
+      });
+    }
+
+    const alternateParts = Array.from(alternatePartsSet);
+    const description = product.ProductDescription || product.Description || "";
+    const packaging = product.Packaging?.Value || product.Packaging?.value || "";
 
     return {
       provider,
@@ -169,11 +215,12 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency }: ProviderReq
       availability,
       moq,
       alternateParts,
+      priceBreaks: mappedBreaks,
+      description,
+      packaging,
     };
   } catch (e: any) {
     console.error(`[${provider}] Error fetching part ${mpn}:`, e.message || e);
-    // console.error(`[${provider}] Stack trace:`, e.stack);
-    // console.log(`[${provider}] ========================================`);
     return { provider, unitPrice: null, totalCost: null, availability: null, error: e.message || "API Error" };
   }
 }

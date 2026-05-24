@@ -1,6 +1,20 @@
-import { ProviderPriceResult, ProviderRequest } from './index';
+import { ProviderPriceResult, ProviderRequest, PriceBreak } from './index';
 
-export async function fetchElement14Price({ mpn, quantity, currency }: ProviderRequest): Promise<ProviderPriceResult> {
+const EXCHANGE_RATES: Record<string, number> = {
+  USD: 1.0,
+  INR: 0.012, // 1 INR = 0.012 USD
+  EUR: 1.08,  // 1 EUR = 1.08 USD
+  GBP: 1.27   // 1 GBP = 1.27 USD
+};
+
+function convertCurrency(amount: number, from: string, to: string): number {
+  if (from === to) return amount;
+  const fromRate = EXCHANGE_RATES[from] || 1.0;
+  const toRate = EXCHANGE_RATES[to] || 1.0;
+  return (amount * fromRate) / toRate;
+}
+
+export async function fetchElement14Price({ mpn, quantity, currency, packagingPreference }: ProviderRequest): Promise<ProviderPriceResult> {
   const apiKey = process.env.ELEMENT14_API_KEY;
   const provider = "Element14";
 
@@ -11,9 +25,10 @@ export async function fetchElement14Price({ mpn, quantity, currency }: ProviderR
 
   try {
     const storeId = currency === 'INR' ? 'in.element14.com' : currency === 'EUR' ? 'uk.farnell.com' : 'www.newark.com';
+    const storeCurrency = storeId === 'in.element14.com' ? 'INR' : storeId === 'uk.farnell.com' ? 'EUR' : 'USD';
 
-    // Build URL with proper parameters matching the provided code
-    const url = `https://api.element14.com/catalog/products?term=manuPartNum%3A${encodeURIComponent(mpn)}&resultsSettings.offset=0&resultsSettings.responseGroup=large&storeInfo.id=${storeId}&resultsSettings.numberOfResults=1&resultsSettings.refinements.filters=inStock&callInfo.omitXmlSchema=false&callInfo.responseDataFormat=json&callinfo.apiKey=${apiKey}`;
+    // Build URL requesting up to 5 results
+    const url = `https://api.element14.com/catalog/products?term=manuPartNum%3A${encodeURIComponent(mpn)}&resultsSettings.offset=0&resultsSettings.responseGroup=large&storeInfo.id=${storeId}&resultsSettings.numberOfResults=5&resultsSettings.refinements.filters=inStock&callInfo.omitXmlSchema=false&callInfo.responseDataFormat=json&callinfo.apiKey=${apiKey}`;
 
     console.log(`[${provider}] Fetching part ${mpn} from ${storeId}`);
 
@@ -26,8 +41,6 @@ export async function fetchElement14Price({ mpn, quantity, currency }: ProviderR
     }
 
     const data = await res.json();
-    console.log(`[${provider}] Response:`, JSON.stringify(data, null, 2));
-
     const numberOfResults = data?.manufacturerPartNumberSearchReturn?.numberOfResults || 0;
 
     if (numberOfResults === 0) {
@@ -36,7 +49,26 @@ export async function fetchElement14Price({ mpn, quantity, currency }: ProviderR
     }
 
     const products = data?.manufacturerPartNumberSearchReturn?.products || [];
-    const product = products[0];
+    
+    // Choose product based on packaging preference
+    let product = products[0];
+
+    if (Array.isArray(products) && products.length > 1 && packagingPreference && packagingPreference !== 'Any') {
+      for (const prod of products) {
+        const descVal = String(prod.displayName || prod.description || '').toLowerCase();
+        
+        const isReel = descVal.includes('reel') || descVal.includes('tr') || descVal.includes('tape & reel');
+        const isCutTape = descVal.includes('cut tape') || descVal.includes('ct') || descVal.includes('strip') || descVal.includes('bag') || descVal.includes('tube') || descVal.includes('tray') || descVal.includes('bulk');
+        
+        if (packagingPreference === 'Reel' && isReel) {
+          product = prod;
+          break;
+        } else if (packagingPreference === 'Cut Tape' && isCutTape) {
+          product = prod;
+          break;
+        }
+      }
+    }
 
     if (!product) {
       return { provider, unitPrice: null, totalCost: null, availability: 0, error: "Part not found" };
@@ -47,19 +79,20 @@ export async function fetchElement14Price({ mpn, quantity, currency }: ProviderR
     // Get availability from stock or inventory
     const availability = product.stock?.level || product.inventoryCode || 0;
 
-    // Parse prices array to find best price for quantity
-    let unitPrice = 0;
+    // Parse prices and MOQ
     const prices = product.prices || [];
-    
-    console.log(`[${provider}] Price breaks:`, JSON.stringify(prices, null, 2));
+    const moq = product.minimumOrderQuantity || 
+                product.orderMultiple || 
+                product.minimumOrder || 
+                (prices.length > 0 ? prices[0].from : 1);
 
-    const moq = product.minimumOrderQuantity || (prices.length > 0 ? prices[0].from : 1);
     const evalQty = Math.max(quantity, moq);
 
+    let unitPrice = 0;
     const sortedBreaks = [...prices].sort((a, b) => (a.from || 0) - (b.from || 0));
     for (const p of sortedBreaks) {
       const fromQty = p.from || 0;
-      const cost = p.cost || 0;
+      const cost = convertCurrency(p.cost || 0, storeCurrency, currency);
       if (fromQty <= evalQty && cost > 0) {
         unitPrice = cost;
       }
@@ -67,15 +100,22 @@ export async function fetchElement14Price({ mpn, quantity, currency }: ProviderR
 
     // Fallback to first price if no match
     if (unitPrice === 0 && sortedBreaks.length > 0) {
-      unitPrice = sortedBreaks[0].cost || 0;
+      unitPrice = convertCurrency(sortedBreaks[0].cost || 0, storeCurrency, currency);
     }
 
-    console.log(`[${provider}] Found: unitPrice=${unitPrice}, availability=${availability}`);
+    // Map all price breaks
+    const mappedBreaks: PriceBreak[] = prices.map((p: any) => ({
+      quantity: p.from || 0,
+      price: convertCurrency(p.cost || 0, storeCurrency, currency)
+    })).filter((b: any) => b.quantity > 0 && b.price > 0);
 
     const alternateParts: string[] = [];
     if (product.rohsSubstitute) {
       alternateParts.push(product.rohsSubstitute);
     }
+
+    const description = product.displayName || product.description || "";
+    const packaging = product.packagingCode || "";
 
     return {
       provider,
@@ -84,6 +124,9 @@ export async function fetchElement14Price({ mpn, quantity, currency }: ProviderR
       availability,
       moq,
       alternateParts,
+      priceBreaks: mappedBreaks,
+      description,
+      packaging,
     };
   } catch (e: any) {
     console.error(`[${provider}] Error fetching part ${mpn}:`, e.message || e);

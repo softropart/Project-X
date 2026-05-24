@@ -15,10 +15,18 @@ export interface BestPriceResult {
   newQty?: number;
   moqRatio?: number;
   alternatives?: BestPriceResult[];
+  description?: string;
+  packaging?: string;
 }
 
-export async function fetchBestPrices(mpn: string, quantity: number, currency: string = 'INR', isAltSearch: boolean = false): Promise<BestPriceResult> {
-  const request = { mpn, quantity, currency };
+export async function fetchBestPrices(
+  mpn: string, 
+  quantity: number, 
+  currency: string = 'INR', 
+  packagingPreference: 'Any' | 'Cut Tape' | 'Reel' = 'Any',
+  isAltSearch: boolean = false
+): Promise<BestPriceResult> {
+  const request = { mpn, quantity, currency, packagingPreference };
   
   // Fetch from all providers concurrently
   const promises = [
@@ -74,6 +82,17 @@ export async function fetchBestPrices(mpn: string, quantity: number, currency: s
     }
   }
 
+  let description = "";
+  let packaging = "";
+  results.forEach(res => {
+    if (res.description && !description) {
+      description = res.description;
+    }
+    if (res.packaging && !packaging) {
+      packaging = res.packaging;
+    }
+  });
+
   let alternatives: BestPriceResult[] = [];
 
   // Fetch alternatives if we are not already doing an alt search
@@ -89,7 +108,7 @@ export async function fetchBestPrices(mpn: string, quantity: number, currency: s
 
     if (altMpns.size > 0) {
       const altPromises = Array.from(altMpns).slice(0, 3).map(altMpn => 
-        fetchBestPrices(altMpn, quantity, currency, true)
+        fetchBestPrices(altMpn, quantity, currency, packagingPreference, true)
       );
       alternatives = await Promise.all(altPromises);
       // Filter out alternates that completely failed
@@ -106,6 +125,8 @@ export async function fetchBestPrices(mpn: string, quantity: number, currency: s
     originalQty: quantity,
     newQty,
     moqRatio,
-    alternatives: alternatives.length > 0 ? alternatives : undefined
+    alternatives: alternatives.length > 0 ? alternatives : undefined,
+    description,
+    packaging
   };
 }
