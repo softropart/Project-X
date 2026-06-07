@@ -3,24 +3,36 @@
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import { Upload, FileSpreadsheet, Loader2, CheckCircle2, AlertCircle, ShoppingCart, ChevronDown, DollarSign, Info, Hash, Settings } from 'lucide-react';
 import { parseExcelFile, ParsedBomItem } from '@/lib/excel-parser';
-import { fetchBestPrices, BestPriceResult } from '@/app/actions/parts';
-import { ProviderPriceResult, PriceBreak } from '@/lib/providers';
+import { fetchStandardizedPartData } from '@/app/actions/parts';
+import { StandardPartData, StandardPackagingCategories, StandardPriceTier, StandardDistributorData } from '@/lib/providers';
+
+export interface CalculatedPrice {
+  provider: string;
+  unitPrice: number | null;
+  totalCost: number | null;
+  availability: number | null;
+  moq: number;
+  isWinner: boolean;
+  error?: string;
+  priceBreaks?: Array<{ quantity: number; price: number }>;
+}
 
 interface BomItemState extends ParsedBomItem {
   status: 'idle' | 'fetching' | 'success' | 'error';
-  prices: ProviderPriceResult[];
+  standardData: StandardPartData | null;
+  prices: CalculatedPrice[];
   selectedProvider: string | null;
   selectedCost: number | null;
   moqUpdated?: boolean;
-  originalQty?: number;
   newQty?: number;
   moqRatio?: number;
-  originalResult?: BestPriceResult;
-  alternatives?: BestPriceResult[];
   selectedMpn?: string;
   description?: string;
-  packaging?: string;
   packagingPreference?: 'Any' | 'Cut Tape' | 'Reel';
+  alternateParts?: string[];
+  suggestedQty?: number | null;
+  suggestedSavings?: number | null;
+  alternateParts?: string[];
 }
 
 const CURRENCIES = [
@@ -28,6 +40,85 @@ const CURRENCIES = [
   { code: 'USD', symbol: '$' },
   { code: 'EUR', symbol: '€' },
 ];
+
+function calculatePricesFromStandardData(
+  data: StandardPartData | null,
+  mpn: string,
+  targetQty: number,
+  pref: 'Any' | 'Cut Tape' | 'Reel'
+): CalculatedPrice[] {
+  if (!data || !data[mpn]) return [];
+  const partData = data[mpn];
+
+  const providers = ['DigiKey', 'Mouser', 'Element14'] as const;
+  const results: CalculatedPrice[] = [];
+
+  for (const provider of providers) {
+    const distData = partData.pricing_by_distributor[provider] as unknown as StandardDistributorData;
+    if (!distData || !distData.packaging) continue;
+
+    const availability = distData.availability || 0;
+
+    let tiersToConsider: StandardPriceTier[] = [];
+    const ctTiers = distData.packaging["Cut-Tape"] || [];
+    const crTiers = distData.packaging["Custom Reel / DigiReel"] || [];
+    const trTiers = distData.packaging["Top-reel"] || [];
+
+    if (pref === 'Cut Tape') {
+      tiersToConsider = [...ctTiers];
+    } else if (pref === 'Reel') {
+      tiersToConsider = [...crTiers, ...trTiers];
+    } else {
+      tiersToConsider = [...ctTiers, ...crTiers, ...trTiers];
+    }
+
+    if (tiersToConsider.length === 0) {
+      results.push({
+        provider,
+        unitPrice: null,
+        totalCost: null,
+        availability: availability > 0 ? availability : 0,
+        moq: 1,
+        isWinner: false,
+        error: "No matching packaging found"
+      });
+      continue;
+    }
+
+    const moq = Math.min(...tiersToConsider.map(t => t.Qty));
+    const evalQty = Math.max(targetQty, moq);
+
+    let unitPrice = 0;
+    const sortedTiers = [...tiersToConsider].sort((a, b) => a.Qty - b.Qty);
+    for (const tier of sortedTiers) {
+      if (tier.Qty <= evalQty && tier.unit_price > 0) {
+        unitPrice = tier.unit_price;
+      }
+    }
+
+    if (unitPrice === 0 && sortedTiers.length > 0) {
+      unitPrice = sortedTiers[0].unit_price;
+    }
+
+    // Map price breaks for uplift checking
+    const priceBreaks = sortedTiers.map(tier => ({
+      quantity: tier.Qty,
+      price: tier.unit_price
+    }));
+
+    results.push({
+      provider,
+      unitPrice: unitPrice > 0 ? unitPrice : null,
+      totalCost: unitPrice > 0 ? parseFloat((unitPrice * evalQty).toFixed(3)) : null,
+      availability,
+      moq,
+      isWinner: false,
+      priceBreaks
+    });
+  }
+
+  return results;
+}
 
 export default function BomTable() {
   const [items, setItems] = useState<BomItemState[]>([]);
@@ -53,6 +144,7 @@ export default function BomTable() {
         setItems(parsedItems.map(item => ({
           ...item,
           status: 'idle',
+          standardData: null,
           prices: [],
           selectedProvider: null,
           selectedCost: null,
@@ -83,7 +175,7 @@ export default function BomTable() {
         wins[item.selectedProvider] = (wins[item.selectedProvider] || 0) + 1;
       }
     });
-    
+
     let majority = 'DigiKey';
     let maxWins = -1;
     for (const [provider, count] of Object.entries(wins)) {
@@ -95,58 +187,143 @@ export default function BomTable() {
     return majority;
   };
 
+  const findWinnerAndMoq = (prices: CalculatedPrice[], targetQty: number, currentItems: BomItemState[]) => {
+    const validResults = prices.filter(r => r.totalCost !== null && !r.error && r.availability !== null && r.availability > 0);
+    let winner: string | null = null;
+    let lowestCost: number | null = null;
+    let suggestedQty: number | null = null;
+    let suggestedSavings: number | null = null;
+
+    if (validResults.length > 0) {
+      const sortedByCost = [...validResults].sort((a, b) => (a.totalCost || 0) - (b.totalCost || 0));
+      lowestCost = sortedByCost[0].totalCost;
+      winner = sortedByCost[0].provider;
+
+      if (sortedByCost.length > 1 && sortedByCost[0].totalCost === sortedByCost[1].totalCost) {
+        const majority = computeMajorityDistributor(currentItems);
+        const tied = sortedByCost.filter(r => r.totalCost === sortedByCost[0].totalCost).map(r => r.provider);
+        if (tied.includes(majority)) {
+          winner = majority;
+        }
+      }
+
+      // Check for quantity uplift opportunity across ALL providers
+      const currentBestCost = lowestCost;
+      let bestUpliftQty: number | null = null;
+      let bestUpliftCost: number | null = null;
+      let bestUpliftSavings: number | null = null;
+
+      console.log(`[Uplift Check] Current best cost for ${targetQty} units: ${currentBestCost}`);
+
+      for (const priceObj of validResults) {
+        const priceBreaks = priceObj.priceBreaks || [];
+        const moq = priceObj.moq || 1;
+        const actualQty = Math.max(targetQty, moq);
+
+        console.log(`[Uplift Check] ${priceObj.provider} - actualQty: ${actualQty}, priceBreaks:`, priceBreaks);
+
+        // Check next price tiers
+        for (const pb of priceBreaks) {
+          if (pb.quantity > actualQty && pb.price > 0 && pb.quantity <= actualQty * 2) {
+            const nextTierTotalCost = pb.quantity * pb.price;
+
+            console.log(`[Uplift Check] ${priceObj.provider} - Tier at qty ${pb.quantity}: price=${pb.price}, totalCost=${nextTierTotalCost}`);
+
+            // Algorithm: If (NextQty × NextTierPrice) < (CurrentBestCost)
+            if (nextTierTotalCost < currentBestCost!) {
+              const savings = currentBestCost! - nextTierTotalCost;
+
+              console.log(`[Uplift Check] 💡 Found savings! Buy ${pb.quantity} for ${nextTierTotalCost} instead of ${actualQty} for ${currentBestCost} = Save ${savings}`);
+
+              // Keep the best uplift suggestion (most savings or smallest qty increase)
+              if (!bestUpliftSavings || savings > bestUpliftSavings ||
+                (savings === bestUpliftSavings && pb.quantity < bestUpliftQty!)) {
+                bestUpliftQty = pb.quantity;
+                bestUpliftCost = nextTierTotalCost;
+                bestUpliftSavings = savings;
+              }
+            }
+
+            // Only check the immediate next tier
+            break;
+          }
+        }
+      }
+
+      if (bestUpliftQty && bestUpliftSavings) {
+        suggestedQty = bestUpliftQty;
+        suggestedSavings = bestUpliftSavings;
+        console.log(`[Uplift Check] ✅ Final suggestion: Buy ${suggestedQty} and save ${suggestedSavings}`);
+      } else {
+        console.log(`[Uplift Check] ❌ No uplift opportunity found`);
+      }
+    }
+
+    if (winner) {
+      prices.forEach(p => p.isWinner = (p.provider === winner));
+    }
+
+    const selectedPriceObj = prices.find(p => p.provider === winner);
+    const activeMoq = selectedPriceObj?.moq || 1;
+    const newQty = Math.max(targetQty, activeMoq);
+    const moqUpdated = newQty > targetQty;
+    const moqRatio = newQty / targetQty;
+
+    return {
+      winner,
+      lowestCost,
+      newQty,
+      moqUpdated,
+      moqRatio,
+      suggestedQty,
+      suggestedSavings
+    };
+  };
+
   const fetchPricesForItems = async (itemsToFetch = items, targetCurrency = currency, targetPackaging = globalPackaging) => {
     if (itemsToFetch.length === 0) return;
-    
+
     setItems(prev => prev.map(item => ({ ...item, status: 'fetching', prices: [], selectedProvider: null, selectedCost: null })));
     setHasFetched(true);
 
     itemsToFetch.forEach(async (item) => {
       try {
         const itemPkg = item.packagingPreference && item.packagingPreference !== 'Any' ? item.packagingPreference : targetPackaging;
-        const res = await fetchBestPrices(item.mpn, item.quantity * assemblies, targetCurrency, itemPkg);
-        
+        const targetQty = item.quantity * assemblies;
+
+        // Fetch new schema data
+        const standardData = await fetchStandardizedPartData(item.mpn, targetCurrency);
+
         setItems(prev => prev.map(p => {
           if (p.id === item.id) {
-            let lowestCost = res.lowestCost;
-            let winner = res.winner;
+            const calculatedPrices = calculatePricesFromStandardData(standardData, item.mpn, targetQty, itemPkg);
+            const { winner, lowestCost, newQty, moqUpdated, moqRatio, suggestedQty, suggestedSavings } = findWinnerAndMoq(calculatedPrices, targetQty, prev);
 
-            // Break ties with the majority distributor if applicable
-            const validResults = res.results.filter(r => r.totalCost !== null && !r.error && r.availability !== null && r.availability > 0);
-            if (validResults.length > 1) {
-              const sortedByCost = [...validResults].sort((a, b) => (a.totalCost || 0) - (b.totalCost || 0));
-              if (sortedByCost[0].totalCost === sortedByCost[1].totalCost) {
-                const majority = computeMajorityDistributor(prev);
-                const tied = sortedByCost.filter(r => r.totalCost === sortedByCost[0].totalCost).map(r => r.provider);
-                if (tied.includes(majority)) {
-                  winner = majority;
-                }
-              }
-            }
+            const partInfo = standardData[item.mpn];
 
-            return { 
-              ...p, 
-              status: 'success', 
-              prices: res.results, 
-              selectedProvider: winner, 
+            return {
+              ...p,
+              status: 'success',
+              standardData,
+              prices: calculatedPrices,
+              selectedProvider: winner,
               selectedCost: lowestCost,
-              moqUpdated: res.moqUpdated,
-              originalQty: res.originalQty,
-              newQty: res.newQty,
-              moqRatio: res.moqRatio,
-              originalResult: res,
-              alternatives: res.alternatives,
-              selectedMpn: res.mpn,
-              description: res.description,
-              packaging: res.packaging,
+              moqUpdated,
+              newQty,
+              moqRatio,
+              selectedMpn: item.mpn,
+              description: partInfo?.description || '',
+              alternateParts: partInfo?.alias_part_numbers || [],
+              suggestedQty,
+              suggestedSavings,
             };
           }
           return p;
         }));
       } catch (e) {
-        setItems(prev => prev.map(p => 
-          p.id === item.id 
-            ? { ...p, status: 'error' } 
+        setItems(prev => prev.map(p =>
+          p.id === item.id
+            ? { ...p, status: 'error' }
             : p
         ));
       }
@@ -164,131 +341,49 @@ export default function BomTable() {
   const recalculateAllPrices = (targetItems: BomItemState[], currentAssemblies: number) => {
     return targetItems.map(item => {
       const baseQty = item.quantity * currentAssemblies;
-      
-      const updatedPrices = item.prices.map(provPrice => {
-        const breaks = provPrice.priceBreaks || [];
-        const moq = provPrice.moq || 1;
-        const evalQty = Math.max(baseQty, moq);
-        
-        let unitPrice = provPrice.unitPrice || 0;
-        
-        if (breaks.length > 0) {
-          const sorted = [...breaks].sort((a, b) => a.quantity - b.quantity);
-          let found = false;
-          for (const b of sorted) {
-            if (b.quantity <= evalQty && b.price > 0) {
-              unitPrice = b.price;
-              found = true;
-            }
-          }
-          if (!found && sorted.length > 0) {
-            unitPrice = sorted[0].price;
-          }
-        }
-        
-        return {
-          ...provPrice,
-          unitPrice,
-          totalCost: parseFloat((unitPrice * evalQty).toFixed(3)),
-        };
-      });
-      
-      let lowestCost: number | null = null;
-      let winner: string | null = null;
-      
-      const validProv = updatedPrices.filter(p => p.unitPrice !== null && !p.error && p.availability !== null && p.availability > 0);
-      if (validProv.length > 0) {
-        const sorted = [...validProv].sort((a, b) => (a.totalCost || 0) - (b.totalCost || 0));
-        lowestCost = sorted[0].totalCost;
-        winner = sorted[0].provider;
-        
-        if (sorted.length > 1 && sorted[0].totalCost === sorted[1].totalCost) {
-          const majority = computeMajorityDistributor(targetItems);
-          const tied = sorted.filter(s => s.totalCost === sorted[0].totalCost).map(s => s.provider);
-          if (tied.includes(majority)) {
-            winner = majority;
-          }
-        }
-      }
-      
-      const activeProvider = item.selectedProvider || winner;
-      const selectedPriceObj = updatedPrices.find(p => p.provider === activeProvider);
-      const activeMoq = selectedPriceObj?.moq || 1;
-      const newQty = Math.max(baseQty, activeMoq);
-      const moqUpdated = newQty > baseQty;
-      const moqRatio = newQty / baseQty;
+      const pref = item.packagingPreference || globalPackaging;
+
+      const calculatedPrices = calculatePricesFromStandardData(item.standardData, item.selectedMpn || item.mpn, baseQty, pref);
+
+      // ALWAYS re-evaluate winner at new quantity to get best price
+      const res = findWinnerAndMoq(calculatedPrices, baseQty, targetItems);
 
       return {
         ...item,
-        prices: updatedPrices,
-        selectedProvider: activeProvider,
-        selectedCost: selectedPriceObj?.totalCost ?? lowestCost,
-        newQty,
-        moqUpdated,
-        moqRatio,
+        prices: calculatedPrices,
+        selectedProvider: res.winner,
+        selectedCost: res.lowestCost,
+        newQty: res.newQty,
+        moqUpdated: res.moqUpdated,
+        moqRatio: res.moqRatio,
+        suggestedQty: res.suggestedQty,
+        suggestedSavings: res.suggestedSavings,
       };
     });
   };
 
   const handleOrderQtyChange = (itemId: string, newOrderQty: number) => {
     if (isNaN(newOrderQty) || newOrderQty < 1) return;
-    
+
     setItems(prev => prev.map(item => {
       if (item.id === itemId) {
-        const updatedPrices = item.prices.map(provPrice => {
-          const breaks = provPrice.priceBreaks || [];
-          const moq = provPrice.moq || 1;
-          const evalQty = Math.max(newOrderQty, moq);
-          
-          let unitPrice = provPrice.unitPrice || 0;
-          
-          if (breaks.length > 0) {
-            const sorted = [...breaks].sort((a, b) => a.quantity - b.quantity);
-            let found = false;
-            for (const b of sorted) {
-              if (b.quantity <= evalQty && b.price > 0) {
-                unitPrice = b.price;
-                found = true;
-              }
-            }
-            if (!found && sorted.length > 0) {
-              unitPrice = sorted[0].price;
-            }
-          }
-          
-          return {
-            ...provPrice,
-            unitPrice,
-            totalCost: parseFloat((unitPrice * evalQty).toFixed(3)),
-          };
-        });
-        
-        let lowestCost: number | null = null;
-        let winner: string | null = null;
-        
-        const validProv = updatedPrices.filter(p => p.unitPrice !== null && !p.error && p.availability !== null && p.availability > 0);
-        if (validProv.length > 0) {
-          const sorted = [...validProv].sort((a, b) => (a.totalCost || 0) - (b.totalCost || 0));
-          lowestCost = sorted[0].totalCost;
-          winner = sorted[0].provider;
-        }
-        
-        const activeProvider = item.selectedProvider || winner;
-        const selectedPriceObj = updatedPrices.find(p => p.provider === activeProvider);
-        const activeMoq = selectedPriceObj?.moq || 1;
-        const newQty = Math.max(newOrderQty, activeMoq);
-        const moqUpdated = newQty > newOrderQty;
-        const moqRatio = newQty / newOrderQty;
-        
+        const pref = item.packagingPreference || globalPackaging;
+        const calculatedPrices = calculatePricesFromStandardData(item.standardData, item.selectedMpn || item.mpn, newOrderQty, pref);
+
+        // ALWAYS re-evaluate to find the best winner at new quantity
+        const res = findWinnerAndMoq(calculatedPrices, newOrderQty, prev);
+
         return {
           ...item,
           quantity: newOrderQty / assemblies,
-          prices: updatedPrices,
-          selectedProvider: activeProvider,
-          selectedCost: selectedPriceObj?.totalCost ?? lowestCost,
-          newQty,
-          moqUpdated,
-          moqRatio,
+          prices: calculatedPrices,
+          selectedProvider: res.winner,
+          selectedCost: res.lowestCost,
+          newQty: res.newQty,
+          moqUpdated: res.moqUpdated,
+          moqRatio: res.moqRatio,
+          suggestedQty: res.suggestedQty,
+          suggestedSavings: res.suggestedSavings,
         };
       }
       return item;
@@ -308,67 +403,27 @@ export default function BomTable() {
   const handleItemPackagingChange = async (itemId: string, newPkg: 'Any' | 'Cut Tape' | 'Reel') => {
     setItems(prev => prev.map(item => {
       if (item.id === itemId) {
-        return { ...item, packagingPreference: newPkg, status: 'fetching' };
-      }
-      return item;
-    }));
-
-    const targetItem = items.find(i => i.id === itemId);
-    if (!targetItem) return;
-
-    try {
-      const res = await fetchBestPrices(targetItem.mpn, targetItem.quantity * assemblies, currency, newPkg);
-      setItems(prev => prev.map(p => {
-        if (p.id === itemId) {
-          return {
-            ...p,
-            status: 'success',
-            prices: res.results,
-            selectedProvider: res.winner,
-            selectedCost: res.lowestCost,
-            moqUpdated: res.moqUpdated,
-            originalQty: res.originalQty,
-            newQty: res.newQty,
-            moqRatio: res.moqRatio,
-            originalResult: res,
-            alternatives: res.alternatives,
-            selectedMpn: res.mpn,
-            description: res.description,
-            packaging: res.packaging,
-          };
-        }
-        return p;
-      }));
-    } catch (e) {
-      setItems(prev => prev.map(p => 
-        p.id === itemId ? { ...p, status: 'error' } : p
-      ));
-    }
-  };
-
-  const handleMpnSelect = (itemId: string, mpnToSelect: string) => {
-    setItems(prev => prev.map(item => {
-      if (item.id === itemId && item.originalResult) {
-        let selectedRes = item.originalResult;
-        if (mpnToSelect !== item.originalResult.mpn) {
-          selectedRes = item.alternatives?.find(a => a.mpn === mpnToSelect) || item.originalResult;
-        }
+        const targetQty = item.quantity * assemblies;
+        const calculatedPrices = calculatePricesFromStandardData(item.standardData, item.selectedMpn || item.mpn, targetQty, newPkg);
+        const { winner, lowestCost, newQty, moqUpdated, moqRatio } = findWinnerAndMoq(calculatedPrices, targetQty, prev);
 
         return {
           ...item,
-          prices: selectedRes.results,
-          selectedProvider: selectedRes.winner,
-          selectedCost: selectedRes.lowestCost,
-          moqUpdated: selectedRes.moqUpdated,
-          newQty: selectedRes.newQty,
-          moqRatio: selectedRes.moqRatio,
-          selectedMpn: selectedRes.mpn,
-          description: selectedRes.description,
-          packaging: selectedRes.packaging,
+          packagingPreference: newPkg,
+          prices: calculatedPrices,
+          selectedProvider: winner,
+          selectedCost: lowestCost,
+          newQty,
+          moqUpdated,
+          moqRatio
         };
       }
       return item;
     }));
+  };
+
+  const handleMpnSelect = (itemId: string, mpnToSelect: string) => {
+    console.log("Alternative part selection to be implemented later", itemId, mpnToSelect);
   };
 
   const handleProviderChange = (itemId: string, newProvider: string) => {
@@ -410,7 +465,7 @@ export default function BomTable() {
         if (selectedCostVal !== null && selectedCostVal > 0) {
           totalCost += selectedCostVal;
           partsAvailable++;
-          
+
           if (item.selectedProvider) {
             splitCounts[item.selectedProvider] = (splitCounts[item.selectedProvider] || 0) + 1;
           }
@@ -442,14 +497,14 @@ export default function BomTable() {
 
   return (
     <div className="w-full max-w-7xl mx-auto space-y-8 duration-700 ease-out">
-      
+
       {/* Controls & Header Row */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-6 bg-white/60 backdrop-blur-xl border border-slate-200/50 shadow-[0_8px_30px_rgb(0,0,0,0.04)] rounded-2xl">
         <div>
           <h2 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-slate-900 to-slate-600">BOM Workspace</h2>
           <p className="text-sm text-slate-500 font-medium">{items.length > 0 ? `${items.length} Parts Loaded` : 'No file uploaded yet'}</p>
         </div>
-        
+
         <div className="flex flex-wrap items-center gap-3">
           {/* Assemblies Multiplier Box */}
           <div className="relative flex items-center">
@@ -557,11 +612,10 @@ export default function BomTable() {
           onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
           onDragLeave={() => setIsDragging(false)}
           onDrop={onDrop}
-          className={`border-2 border-dashed rounded-3xl p-16 text-center transition-all duration-300 ease-out ${
-            isDragging 
-              ? 'border-blue-400 bg-blue-50/50 scale-[1.02] shadow-xl shadow-blue-500/10' 
-              : 'border-slate-200 hover:border-slate-300 bg-white/50 hover:bg-white/80 shadow-sm hover:shadow-md'
-          }`}
+          className={`border-2 border-dashed rounded-3xl p-16 text-center transition-all duration-300 ease-out ${isDragging
+            ? 'border-blue-400 bg-blue-50/50 scale-[1.02] shadow-xl shadow-blue-500/10'
+            : 'border-slate-200 hover:border-slate-300 bg-white/50 hover:bg-white/80 shadow-sm hover:shadow-md'
+            }`}
         >
           {isParsing ? (
             <div className="flex flex-col items-center gap-4 text-slate-500">
@@ -578,15 +632,15 @@ export default function BomTable() {
                 <p className="text-slate-500 mt-2 font-medium">Supports .xlsx and .csv formats</p>
               </div>
               <label className="mt-4 cursor-pointer">
-                <input 
-                  type="file" 
-                  className="hidden" 
-                  accept=".xlsx, .xls, .csv" 
+                <input
+                  type="file"
+                  className="hidden"
+                  accept=".xlsx, .xls, .csv"
                   onChange={(e) => {
                     if (e.target.files && e.target.files.length > 0) {
                       handleFileUpload(e.target.files[0]);
                     }
-                  }} 
+                  }}
                 />
                 <span className="bg-white border border-slate-200 text-slate-700 hover:text-slate-900 hover:border-slate-300 hover:bg-slate-50 px-6 py-3 rounded-xl font-semibold transition-all shadow-sm hover:shadow inline-block">
                   Browse Files
@@ -615,255 +669,165 @@ export default function BomTable() {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {items.map((item, idx) => {
-                  const hasAlternates = item.alternatives && item.alternatives.length > 0;
-                  const currentlySelectedMpn = item.selectedMpn || item.mpn;
                   const highMoqRatio = item.moqRatio && item.moqRatio > 1.3;
+                  const validPrices = item.prices.filter(p => p.unitPrice !== null && !p.error);
+                  const activeProvider = item.selectedProvider;
+                  const alternateParts = item.alternateParts || [];
 
-                  const rowOptions = [
-                    { 
-                      isOriginal: true, 
-                      mpn: item.mpn, 
-                      resultObj: item.originalResult,
-                      prices: item.originalResult ? item.originalResult.results : item.prices,
-                      moqUpdated: item.originalResult ? item.originalResult.moqUpdated : item.moqUpdated,
-                      newQty: item.originalResult ? item.originalResult.newQty : item.newQty,
-                      description: item.description,
-                    },
-                    ...(item.alternatives || []).map(alt => ({
-                      isOriginal: false,
-                      mpn: alt.mpn,
-                      resultObj: alt,
-                      prices: alt.results,
-                      moqUpdated: alt.moqUpdated,
-                      newQty: alt.newQty,
-                      description: alt.description,
-                    }))
-                  ];
+                  let activeCost = null;
+                  if (activeProvider) {
+                    const pData = validPrices.find(p => p.provider === activeProvider);
+                    if (pData) {
+                      activeCost = pData.totalCost;
+                    }
+                  }
 
                   return (
-                    <React.Fragment key={item.id}>
-                      {rowOptions.map((rowOpt, optIdx) => {
-                        const isSelected = currentlySelectedMpn === rowOpt.mpn;
-                        const isOriginal = rowOpt.isOriginal;
-                        
-                        const activeProvider = isSelected ? item.selectedProvider : rowOpt.resultObj?.winner;
-                        // Relaxed provider filtering: allow out of stock in dropdown but indicate it
-                        const validPrices = rowOpt.prices.filter(p => p.unitPrice !== null && !p.error);
-                        
-                        const digiKeyPriceObj = rowOpt.prices.find(p => p.provider === 'DigiKey');
-                        const alternateParts = digiKeyPriceObj?.alternateParts || [];
+                    <tr key={item.id} className={`transition-colors group ${highMoqRatio ? 'bg-amber-50/20' : 'bg-white'}`}>
+                      <td className="px-4 py-4 text-center font-semibold text-slate-400">
+                        {idx + 1}
+                      </td>
 
-                        let activeCost = null;
-                        if (activeProvider) {
-                           const pData = validPrices.find(p => p.provider === activeProvider);
-                           if (pData) {
-                             activeCost = pData.totalCost;
-                           }
-                        }
+                      <td className="px-6 py-4 flex items-start gap-2">
+                        <div className="flex-grow">
+                          <div className="font-semibold text-slate-800 flex items-center gap-2">
+                            <span>{item.mpn}</span>
 
-                        return (
-                          <tr key={`${item.id}-${rowOpt.mpn}`} className={`transition-colors group ${
-                            isSelected ? (highMoqRatio && isOriginal ? 'bg-amber-50/20' : 'bg-white') : 'bg-slate-50/30 text-slate-400'
-                          }`}>
-                            
-                            {/* SL# Column */}
-                            <td className="px-4 py-4 text-center font-semibold text-slate-400">
-                              {isOriginal && optIdx === 0 ? idx + 1 : ""}
-                            </td>
-
-                            <td className={`px-6 py-4 flex items-start gap-2 ${!isOriginal ? 'pl-14 relative' : ''}`}>
-                              {!isOriginal && (
-                                <div className="absolute left-6 top-0 bottom-1/2 w-4 border-l-2 border-b-2 border-slate-200 rounded-bl-lg"></div>
-                              )}
-                              
-                              {hasAlternates ? (
-                                <div className="flex items-center justify-center mt-1 mr-2 z-10">
-                                  <input 
-                                    type="radio" 
-                                    checked={isSelected}
-                                    onChange={() => handleMpnSelect(item.id, rowOpt.mpn)}
-                                    className="w-4 h-4 text-blue-600 border-slate-300 focus:ring-blue-500 cursor-pointer"
-                                  />
-                                </div>
-                              ) : null}
-
-                              <div>
-                                <div className={`font-semibold ${isSelected ? 'text-slate-800' : 'text-slate-500'} flex items-center`}>
-                                  {rowOpt.mpn} {!isOriginal && <span className="text-xs font-normal text-slate-400 ml-1">(Alt)</span>}
-                                </div>
-                                {highMoqRatio && isOriginal && (
-                                  <div className={`mt-1 text-[10px] ${isSelected ? 'text-amber-600' : 'text-amber-600/50'} font-medium flex items-center gap-1`}>
-                                    <AlertCircle className="w-3 h-3" /> High MOQ ({item.moqRatio?.toFixed(1)}x)
+                            {/* Alias Hover Tooltip Info Icon */}
+                            {alternateParts.length > 0 && (
+                              <div className="relative inline-block group cursor-pointer z-20">
+                                <Info className="w-4 h-4 text-slate-400 hover:text-blue-500 transition-colors" />
+                                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 bg-slate-900/95 backdrop-blur-md text-white text-[10px] p-3 rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none">
+                                  <p className="font-bold border-b border-slate-700 pb-1 mb-1 text-slate-300 uppercase tracking-wide">Equivalent Alias Parts</p>
+                                  <div className="space-y-1 max-h-32 overflow-y-auto font-mono">
+                                    {alternateParts.map(alt => (
+                                      <div key={alt} className="bg-white/10 px-1 py-0.5 rounded text-center">{alt}</div>
+                                    ))}
                                   </div>
-                                )}
+                                </div>
                               </div>
-                            </td>
+                            )}
+                          </div>
+                          {highMoqRatio && (
+                            <div className="mt-1 text-[10px] text-amber-600 font-medium flex items-center gap-1">
+                              <AlertCircle className="w-3 h-3" /> High MOQ ({item.moqRatio?.toFixed(1)}x)
+                            </div>
+                          )}
+                        </div>
+                      </td>
 
-                            {/* Description Column (scrollable) */}
-                            <td className="px-6 py-4 max-w-[180px] overflow-x-auto whitespace-nowrap scrollbar-thin text-slate-500 font-medium text-xs">
-                              {typeof rowOpt.description === 'string' 
-                                ? rowOpt.description 
-                                : (rowOpt.description as any)?.ProductDescription || (rowOpt.description as any)?.DetailedDescription || '-'}
-                            </td>
+                      <td className="px-6 py-4 max-w-[180px] overflow-x-auto whitespace-nowrap scrollbar-thin text-slate-500 font-medium text-xs">
+                        {typeof item.description === 'string'
+                          ? item.description || '-'
+                          : (item.description as any)?.ProductDescription || (item.description as any)?.DetailedDescription || '-'}
+                      </td>
 
-                            <td className="px-6 py-4 font-semibold text-slate-600">
-                              {item.quantity}
-                            </td>
+                      <td className="px-6 py-4 font-semibold text-slate-600">
+                        {item.quantity}
+                      </td>
 
-                            {/* Editable Order Quantity */}
-                            <td className="px-6 py-4">
-                              {isOriginal ? (
-                                <input
-                                  type="number"
-                                  min="1"
-                                  value={isSelected ? (item.newQty ?? item.quantity * assemblies) : (rowOpt.newQty ?? item.quantity * assemblies)}
-                                  onChange={(e) => handleOrderQtyChange(item.id, parseInt(e.target.value))}
-                                  disabled={!isSelected}
-                                  className={`w-20 font-bold border rounded-lg px-2 py-1 focus:outline-none transition-all ${
-                                    isSelected 
-                                      ? 'bg-blue-50/50 text-blue-700 border-blue-200 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500' 
-                                      : 'bg-slate-50 text-slate-400 border-slate-100 cursor-not-allowed'
+                      <td className="px-6 py-4">
+                        <input
+                          type="number"
+                          min="1"
+                          value={item.newQty ?? item.quantity * assemblies}
+                          onChange={(e) => handleOrderQtyChange(item.id, parseInt(e.target.value))}
+                          className="w-20 font-bold border rounded-lg px-2 py-1 focus:outline-none transition-all bg-blue-50/50 text-blue-700 border-blue-200 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                        />
+                        {item.moqUpdated && (
+                          <div className="mt-1">
+                            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded border text-amber-700 bg-amber-100 border-amber-200" title="Adjusted to meet Vendor MOQ">
+                              MOQ APPLIED
+                            </span>
+                          </div>
+                        )}
+                        {item.suggestedQty && item.suggestedSavings && (
+                          <div className="mt-1">
+                            <button
+                              onClick={() => handleOrderQtyChange(item.id, item.suggestedQty!)}
+                              className="text-[9px] font-bold px-1.5 py-0.5 rounded border text-green-700 bg-green-50 border-green-200 hover:bg-green-100 transition-colors cursor-pointer"
+                              title={`Buy ${item.suggestedQty} instead and save ${currencySymbol}${item.suggestedSavings.toFixed(2)}`}
+                            >
+                              💡 Buy {item.suggestedQty} (Save {currencySymbol}{item.suggestedSavings.toFixed(2)})
+                            </button>
+                          </div>
+                        )}
+                      </td>
+
+                      <td className="px-6 py-4">
+                        <select
+                          value={item.packagingPreference || 'Any'}
+                          onChange={(e) => handleItemPackagingChange(item.id, e.target.value as any)}
+                          className="bg-white border border-slate-200 text-slate-700 text-xs font-semibold py-1 px-2 rounded-lg hover:border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500/20 cursor-pointer w-32"
+                        >
+                          <option value="Any">Any Pkg</option>
+                          <option value="Cut Tape">Cut Tape</option>
+                          <option value="Reel">Tape & Reel</option>
+                        </select>
+                      </td>
+
+                      <td className="px-6 py-4">
+                        {item.status === 'idle' && <span className="text-slate-400 italic font-medium">Awaiting fetch...</span>}
+
+                        {item.status === 'fetching' && (
+                          <div className="flex items-center gap-2 text-blue-600 font-medium">
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            <span>Searching...</span>
+                          </div>
+                        )}
+
+                        {item.status === 'error' && (
+                          <div className="flex items-center gap-2 text-red-600 font-medium">
+                            <AlertCircle className="w-4 h-4" />
+                            <span>Failed</span>
+                          </div>
+                        )}
+
+                        {item.status === 'success' && validPrices.length > 0 && (
+                          <div className="relative flex items-center gap-1.5">
+                            <div className="relative flex-grow">
+                              <select
+                                value={item.selectedProvider || ''}
+                                onChange={(e) => handleProviderChange(item.id, e.target.value)}
+                                className={`appearance-none w-full border font-semibold py-1.5 pl-3 pr-8 rounded-lg outline-none transition-all cursor-pointer text-xs ${item.selectedProvider === item.prices.find(p => p.isWinner)?.provider
+                                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800 focus:ring-2 focus:ring-emerald-500/20'
+                                  : 'bg-white border-slate-200 text-slate-700 focus:ring-2 focus:ring-blue-500/20'
                                   }`}
-                                />
-                              ) : (
-                                <span className="px-2 py-1 font-semibold text-slate-400 bg-slate-100 rounded-lg">
-                                  {rowOpt.newQty ?? item.quantity * assemblies}
-                                </span>
-                              )}
-                              {(isSelected ? item.moqUpdated : rowOpt.moqUpdated) && (
-                                <div className="mt-1">
-                                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
-                                    isSelected 
-                                      ? 'text-amber-700 bg-amber-100 border-amber-200'
-                                      : 'text-amber-700/50 bg-amber-50/50 border-amber-200/50'
-                                  }`} title="Adjusted to meet Vendor MOQ">
-                                    MOQ APPLIED
-                                  </span>
-                                </div>
-                              )}
-                            </td>
+                              >
+                                {validPrices.map(p => {
+                                  const stockText = p.availability === 0 ? "Out of Stock" : `Stock: ${p.availability?.toLocaleString()}`;
+                                  return (
+                                    <option key={p.provider} value={p.provider}>
+                                      {p.provider} ({currencySymbol}{p.unitPrice?.toFixed(2)} | {stockText}) {p.isWinner ? '✨ (Best)' : ''}
+                                    </option>
+                                  );
+                                })}
+                              </select>
+                              <ChevronDown className="w-4 h-4 text-slate-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                            </div>
+                          </div>
+                        )}
 
-                            {/* Per-item Packaging Options Selection */}
-                            <td className="px-6 py-4">
-                              {isOriginal ? (
-                                <select
-                                  value={item.packagingPreference || 'Any'}
-                                  onChange={(e) => handleItemPackagingChange(item.id, e.target.value as any)}
-                                  className="bg-white border border-slate-200 text-slate-700 text-xs font-semibold py-1 px-2 rounded-lg hover:border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500/20 cursor-pointer w-32"
-                                >
-                                  <option value="Any">Any Pkg</option>
-                                  <option value="Cut Tape">Cut Tape</option>
-                                  <option value="Reel">Tape & Reel</option>
-                                </select>
-                              ) : (
-                                <span className="text-xs text-slate-400 font-semibold uppercase">{rowOpt.resultObj?.packaging || '-'}</span>
-                              )}
-                            </td>
-                            
-                            <td className="px-6 py-4">
-                              {item.status === 'idle' && <span className="text-slate-400 italic font-medium">Awaiting fetch...</span>}
-                              
-                              {item.status === 'fetching' && (
-                                <div className="flex items-center gap-2 text-blue-600 font-medium">
-                                  <Loader2 className="w-4 h-4 animate-spin" />
-                                  <span>Searching...</span>
-                                </div>
-                              )}
-                              
-                              {item.status === 'error' && (
-                                <div className="flex items-center gap-2 text-red-600 font-medium">
-                                  <AlertCircle className="w-4 h-4" />
-                                  <span>Failed</span>
-                                </div>
-                              )}
-                              
-                              {item.status === 'success' && validPrices.length > 0 && isSelected && (
-                                <div className="relative flex items-center gap-1.5">
-                                  <div className="relative flex-grow">
-                                    <select
-                                      value={item.selectedProvider || ''}
-                                      onChange={(e) => handleProviderChange(item.id, e.target.value)}
-                                      className={`appearance-none w-full border font-semibold py-1.5 pl-3 pr-8 rounded-lg outline-none transition-all cursor-pointer text-xs ${
-                                        item.selectedProvider === item.prices.find(p => p.isWinner)?.provider
-                                          ? 'bg-emerald-50 border-emerald-200 text-emerald-800 focus:ring-2 focus:ring-emerald-500/20'
-                                          : 'bg-white border-slate-200 text-slate-700 focus:ring-2 focus:ring-blue-500/20'
-                                      }`}
-                                    >
-                                      {validPrices.map(p => {
-                                        const stockText = p.availability === 0 ? "Out of Stock" : `Stock: ${p.availability?.toLocaleString()}`;
-                                        return (
-                                          <option key={p.provider} value={p.provider}>
-                                            {p.provider} ({currencySymbol}{p.unitPrice?.toFixed(2)} | {stockText}) {p.isWinner ? '✨ (Best)' : ''}
-                                          </option>
-                                        );
-                                      })}
-                                    </select>
-                                    <ChevronDown className="w-4 h-4 text-slate-400 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                                  </div>
+                        {item.status === 'success' && validPrices.length === 0 && (
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border text-rose-600 bg-rose-50 border-rose-100">
+                            <AlertCircle className="w-3.5 h-3.5" /> No Stock
+                          </span>
+                        )}
+                      </td>
 
-                                  {/* DigiKey Alias Hover Tooltip Info Icon */}
-                                  {item.selectedProvider === "DigiKey" && alternateParts && alternateParts.length > 0 && (
-                                    <div className="relative inline-block group cursor-pointer z-20">
-                                      <Info className="w-4 h-4 text-slate-400 hover:text-blue-500 transition-colors" />
-                                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 bg-slate-900/95 backdrop-blur-md text-white text-[10px] p-3 rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none">
-                                        <p className="font-bold border-b border-slate-700 pb-1 mb-1 text-slate-300 uppercase tracking-wide">Equivalent Alias Parts</p>
-                                        <div className="space-y-1 max-h-32 overflow-y-auto font-mono">
-                                          {alternateParts.map(alt => (
-                                            <div key={alt} className="bg-white/10 px-1 py-0.5 rounded text-center">{alt}</div>
-                                          ))}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-
-                              {item.status === 'success' && validPrices.length > 0 && !isSelected && (
-                                <div className="text-slate-500 font-semibold flex items-center gap-1.5">
-                                  {activeProvider || 'No provider'} {rowOpt.resultObj?.winner === activeProvider && '✨'}
-                                  {activeProvider === "DigiKey" && alternateParts && alternateParts.length > 0 && (
-                                    <div className="relative inline-block group cursor-pointer z-20">
-                                      <Info className="w-4 h-4 text-slate-400 hover:text-blue-500 transition-colors" />
-                                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 bg-slate-900/95 backdrop-blur-md text-white text-[10px] p-3 rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 pointer-events-none">
-                                        <p className="font-bold border-b border-slate-700 pb-1 mb-1 text-slate-300 uppercase tracking-wide">Equivalent Alias Parts</p>
-                                        <div className="space-y-1 max-h-32 overflow-y-auto font-mono">
-                                          {alternateParts.map(alt => (
-                                            <div key={alt} className="bg-white/10 px-1 py-0.5 rounded text-center">{alt}</div>
-                                          ))}
-                                        </div>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-
-                              {item.status === 'success' && validPrices.length === 0 && (
-                                <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border ${
-                                  isSelected 
-                                    ? 'text-rose-600 bg-rose-50 border-rose-100'
-                                    : 'text-rose-400 bg-rose-50/50 border-rose-100/50'
-                                  }`}>
-                                  <AlertCircle className="w-3.5 h-3.5" /> No Stock
-                                </span>
-                              )}
-                            </td>
-
-                            <td className="px-6 py-4 text-right">
-                              {item.status === 'success' && activeCost !== null ? (
-                                <div className="flex flex-col items-end">
-                                  <span className={`font-bold text-base ${isSelected ? 'text-slate-900' : 'text-slate-400'}`}>
-                                    {currencySymbol}{activeCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                  </span>
-                                  <span className={`text-[9px] font-semibold uppercase tracking-wider ${isSelected ? 'text-slate-400' : 'text-slate-300'}`}>Total</span>
-                                </div>
-                              ) : (
-                                <span className="text-slate-300 font-medium">-</span>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </React.Fragment>
+                      <td className="px-6 py-4 text-right">
+                        {item.status === 'success' && activeCost !== null ? (
+                          <div className="flex flex-col items-end">
+                            <span className="font-bold text-base text-slate-900">
+                              {currencySymbol}{activeCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                            </span>
+                            <span className="text-[9px] font-semibold uppercase tracking-wider text-slate-400">Total</span>
+                          </div>
+                        ) : (
+                          <span className="text-slate-300 font-medium">-</span>
+                        )}
+                      </td>
+                    </tr>
                   );
                 })}
               </tbody>

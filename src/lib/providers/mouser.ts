@@ -1,4 +1,4 @@
-import { ProviderPriceResult, ProviderRequest, PriceBreak } from './index';
+import { ProviderPriceResult, ProviderRequest, PriceBreak, StandardProviderResult, StandardPackagingCategories, StandardPriceTier } from './index';
 
 const EXCHANGE_RATES: Record<string, number> = {
   USD: 1.0,
@@ -41,8 +41,6 @@ export async function fetchMouserPrice({ mpn, quantity, currency, packagingPrefe
     console.error(`[${provider}] API credentials missing.`);
     return { provider, unitPrice: null, totalCost: null, availability: null, error: "Credentials missing" };
   }
-
-  console.log(`[${provider}] Fetching part ${mpn} with quantity ${quantity}`);
 
   try {
     const res = await fetch(`https://api.mouser.com/api/v1/search/keyword?apiKey=${apiKey}`, {
@@ -89,7 +87,6 @@ export async function fetchMouserPrice({ mpn, quantity, currency, packagingPrefe
     }
 
     if (!part) {
-      console.log(`[${provider}] Part not found`);
       return { provider, unitPrice: null, totalCost: null, availability: 0, error: "Part not found" };
     }
 
@@ -159,5 +156,127 @@ export async function fetchMouserPrice({ mpn, quantity, currency, packagingPrefe
   } catch (e: any) {
     console.error(`[${provider}] Error fetching part ${mpn}:`, e.message || e);
     return { provider, unitPrice: null, totalCost: null, availability: null, error: e.message || "API Error" };
+  }
+}
+
+export async function fetchMouserStandardized(mpn: string, currency: string = 'INR'): Promise<StandardProviderResult> {
+  const apiKey = process.env.MOUSER_API_KEY;
+  const provider = "Mouser";
+
+  const emptyCategories: StandardPackagingCategories = {
+    "Custom Reel / DigiReel": [],
+    "Cut-Tape": [],
+    "Top-reel": []
+  };
+
+  if (!apiKey) {
+    return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
+  }
+
+  try {
+    const res = await fetch(`https://api.mouser.com/api/v1/search/keyword?apiKey=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        SearchByKeywordRequest: {
+          keyword: mpn,
+          records: 10,
+          startingRecord: 0,
+          searchOptions: "string",
+          searchWithYourSignUpLanguage: "string"
+        }
+      })
+    });
+
+    if (!res.ok) {
+      return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
+    }
+
+    const data = await res.json();
+    
+    if (!data?.SearchResults?.Parts || data.SearchResults.Parts.length === 0) {
+      return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
+    }
+
+    const categories: StandardPackagingCategories = {
+      "Custom Reel / DigiReel": [],
+      "Cut-Tape": [],
+      "Top-reel": []
+    };
+
+    let mainDescription = "";
+    const alternatePartsSet = new Set<string>();
+    let maxAvailability = 0;
+
+    for (const part of data.SearchResults.Parts) {
+      if (!mainDescription) {
+        mainDescription = part.Description || "";
+      }
+
+      let currentAvail = 0;
+      const availStr = part.Availability || '';
+      if (availStr && !availStr.toLowerCase().includes('on order') && !availStr.toLowerCase().includes('backorder') && !availStr.toLowerCase().includes('out of stock')) {
+        const parsedAvail = parseInt(availStr.replace(/[^0-9]/g, ''), 10);
+        if (!isNaN(parsedAvail)) {
+          currentAvail = parsedAvail;
+        }
+      }
+      if (currentAvail > maxAvailability) {
+        maxAvailability = currentAvail;
+      }
+
+      // Mouser uses ProductAttributes array for packaging options
+      const productAttributes = part.ProductAttributes || [];
+
+      // Extract all packaging types from ProductAttributes
+      const packagingOptions = productAttributes
+        .filter((attr: any) => attr.AttributeName === 'Packaging')
+        .map((attr: any) => attr.AttributeValue?.toLowerCase() || '');
+
+      const priceBreaks = part.PriceBreaks || [];
+      const mappedBreaks: StandardPriceTier[] = priceBreaks.map((pb: any) => ({
+        Qty: pb.Quantity || 0,
+        unit_price: parseAndConvertPrice(pb.Price || '', currency),
+        currency
+      })).filter((b: any) => b.Qty > 0 && b.unit_price > 0);
+
+      if (mappedBreaks.length > 0) {
+        // Map packaging options to categories
+        for (const packagingVal of packagingOptions) {
+          if (packagingVal.includes('mousereel') || packagingVal.includes('mouse-reel') || packagingVal.includes('mousereel')) {
+            if (categories["Custom Reel / DigiReel"].length === 0) {
+              categories["Custom Reel / DigiReel"] = mappedBreaks;
+            }
+          } else if (packagingVal.includes('cut tape') || packagingVal === 'cut tape') {
+            if (categories["Cut-Tape"].length === 0) {
+              categories["Cut-Tape"] = mappedBreaks;
+            }
+          } else if (packagingVal.includes('reel') || packagingVal === 'reel' || packagingVal.includes('tape & reel')) {
+            if (categories["Top-reel"].length === 0) {
+              categories["Top-reel"] = mappedBreaks;
+            }
+          }
+        }
+      }
+
+      if (Array.isArray(part.AlternatePackagings)) {
+        part.AlternatePackagings.forEach((ap: any) => {
+          if (ap.APMfrPN && ap.APMfrPN.trim() !== mpn) {
+            alternatePartsSet.add(ap.APMfrPN.trim());
+          }
+        });
+      }
+    }
+
+    return {
+      provider,
+      categories,
+      description: mainDescription,
+      alternateParts: Array.from(alternatePartsSet),
+      availability: maxAvailability
+    };
+
+  } catch (e) {
+    return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
   }
 }

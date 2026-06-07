@@ -1,4 +1,4 @@
-import { ProviderPriceResult, ProviderRequest, PriceBreak } from './index';
+import { ProviderPriceResult, ProviderRequest, PriceBreak, StandardProviderResult, StandardPackagingCategories, StandardPriceTier } from './index';
 
 // Simple in-memory token cache
 let cachedToken: { token: string; expiresAt: number } | null = null;
@@ -6,7 +6,7 @@ let cachedToken: { token: string; expiresAt: number } | null = null;
 async function getAccessToken(clientId: string, clientSecret: string): Promise<string> {
   // Return cached token if still valid (with 60s buffer)
   if (cachedToken && Date.now() < cachedToken.expiresAt - 60000) {
-    // console.log('[DigiKey] Using cached OAuth token');
+    console.log('[DigiKey] Using cached OAuth token');
     return cachedToken.token;
   }
 
@@ -15,8 +15,9 @@ async function getAccessToken(clientId: string, clientSecret: string): Promise<s
     ? 'https://sandbox-api.digikey.com/v1/oauth2/token'
     : 'https://api.digikey.com/v1/oauth2/token';
 
-  // console.log(`[DigiKey] Requesting OAuth token from ${useSandbox ? 'SANDBOX' : 'PRODUCTION'}`);
-  // console.log(`[DigiKey] Token URL: ${tokenUrl}`);
+  console.log(`[DigiKey] Requesting OAuth token from ${useSandbox ? 'SANDBOX' : 'PRODUCTION'}`);
+  console.log(`[DigiKey] Token URL: ${tokenUrl}`);
+  console.log(`[DigiKey] Client ID: ${clientId.substring(0, 10)}...`);
 
   const params = new URLSearchParams();
   params.append('client_id', clientId);
@@ -29,6 +30,8 @@ async function getAccessToken(clientId: string, clientSecret: string): Promise<s
     body: params.toString(),
   });
 
+  console.log(`[DigiKey] OAuth response status: ${res.status}`);
+
   if (!res.ok) {
     const errText = await res.text();
     console.error(`[DigiKey] OAuth token request failed (${res.status}): ${errText}`);
@@ -39,7 +42,7 @@ async function getAccessToken(clientId: string, clientSecret: string): Promise<s
   const token = data.access_token;
   const expiresIn = data.expires_in || 600; // default 10 min
 
-  // console.log(`[DigiKey] OAuth token obtained successfully, expires in ${expiresIn}s`);
+  console.log(`[DigiKey] OAuth token obtained successfully, expires in ${expiresIn}s`);
 
   cachedToken = {
     token,
@@ -55,6 +58,10 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
 
   const provider = "DigiKey";
 
+  console.log(`[${provider}] ========================================`);
+  console.log(`[${provider}] Fetching part: ${mpn}`);
+  console.log(`[${provider}] Quantity: ${quantity}, Currency: ${currency}`);
+
   if (!clientId || !clientSecret) {
     console.error(`[${provider}] API credentials missing.`);
     return { provider, unitPrice: null, totalCost: null, availability: null, error: "Credentials missing" };
@@ -68,17 +75,23 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
     const localeSite = currency === 'INR' ? 'IN' : currency === 'EUR' ? 'DE' : 'US';
     const localeLanguage = 'en';
 
+    console.log(`[${provider}] Locale: Site=${localeSite}, Language=${localeLanguage}, Currency=${currency}`);
+
     // Step 3: Call V4 keyword search
     const useSandbox = process.env.DIGIKEY_USE_SANDBOX === 'true';
     const searchUrl = useSandbox
       ? 'https://sandbox-api.digikey.com/products/v4/search/keyword'
       : 'https://api.digikey.com/products/v4/search/keyword';
 
+    console.log(`[${provider}] Search URL (${useSandbox ? 'SANDBOX' : 'PRODUCTION'}): ${searchUrl}`);
+
     const requestBody = {
       Keywords: mpn,
       Limit: 5, // Increased to get packaging options and alternate parts
       Offset: 0,
     };
+
+    console.log(`[${provider}] Request body:`, JSON.stringify(requestBody, null, 2));
 
     const res = await fetch(searchUrl, {
       method: 'POST',
@@ -95,6 +108,8 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
       body: JSON.stringify(requestBody),
     });
 
+    console.log(`[${provider}] Response status: ${res.status}`);
+
     if (!res.ok) {
       const errBody = await res.text();
       console.error(`[${provider}] API error response:`, errBody);
@@ -102,6 +117,7 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
     }
 
     const data = await res.json();
+    console.log(`[${provider}] Raw response:`, JSON.stringify(data, null, 2));
     
     // Choose product based on packaging preference
     let product = data?.Products?.[0];
@@ -129,11 +145,20 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
     }
 
     if (!product) {
+      console.log(`[${provider}] Part not found in response`);
       return { provider, unitPrice: null, totalCost: null, availability: 0, error: "Part not found" };
     }
 
+    console.log(`[${provider}] Selected product at index ${matchedProductIndex}`);
+    console.log(`[${provider}] Product MPN: ${product.ManufacturerPartNumber || 'N/A'}`);
+    console.log(`[${provider}] Product DigiKey PN: ${product.DigiKeyPartNumber || 'N/A'}`);
+    console.log(`[${provider}] Product Packaging: ${product.Packaging?.Value || product.Packaging?.value || 'N/A'}`);
+
     // Extract pricing details
     const priceBreaks = product?.StandardPricing || product?.ProductVariations?.[0]?.StandardPricing || [];
+
+    console.log(`[${provider}] Price breaks found: ${priceBreaks.length}`);
+    console.log(`[${provider}] Price breaks data:`, JSON.stringify(priceBreaks, null, 2));
 
     const moq = product.MinimumOrderQuantity || 
                 product.MinimumOrderQty || 
@@ -143,7 +168,11 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
                 product.ProductVariations?.[0]?.StandardPricing?.[0]?.BreakQuantity || 
                 1;
 
+    console.log(`[${provider}] MOQ determined: ${moq}`);
+
     const evalQty = Math.max(quantity, moq);
+
+    console.log(`[${provider}] Evaluating quantity: ${evalQty} (requested: ${quantity}, MOQ: ${moq})`);
 
     let unitPrice = 0;
     const sortedBreaks = [...priceBreaks].sort((a, b) => (a.BreakQuantity || 0) - (b.BreakQuantity || 0));
@@ -152,17 +181,23 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
       const price = pb.UnitPrice || 0;
       if (breakQty <= evalQty && price > 0) {
         unitPrice = price;
+        console.log(`[${provider}] Price break match: Qty ${breakQty} -> ${currency} ${price}`);
       }
     }
 
     // Fallback: try UnitPrice directly on product
     if (unitPrice === 0 && product.UnitPrice) {
       unitPrice = product.UnitPrice;
+      console.log(`[${provider}] Using direct UnitPrice from product: ${unitPrice}`);
     }
+
+    console.log(`[${provider}] Final unitPrice selected: ${unitPrice}`);
 
     // Robust stock availability checking
     const qtyAvailable = product.QuantityAvailable !== undefined ? product.QuantityAvailable : null;
     const qtyOnHand = product.QuantityOnHand !== undefined ? product.QuantityOnHand : null;
+    
+    console.log(`[${provider}] Raw availability - QuantityAvailable: ${qtyAvailable}, QuantityOnHand: ${qtyOnHand}`);
     
     let availability = 0;
     if (qtyAvailable !== null && qtyAvailable > 0) {
@@ -172,6 +207,8 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
     } else if (qtyOnHand !== null && qtyOnHand > 0) {
       availability = qtyOnHand;
     }
+
+    console.log(`[${provider}] Computed availability: ${availability}`);
 
     // Map all price breaks
     const mappedBreaks: PriceBreak[] = priceBreaks.map((pb: any) => ({
@@ -208,6 +245,11 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
     const description = product.ProductDescription || product.Description || "";
     const packaging = product.Packaging?.Value || product.Packaging?.value || "";
 
+    console.log(`[${provider}] Final result: unitPrice=${unitPrice}, totalCost=${unitPrice * evalQty}, availability=${availability}`);
+    console.log(`[${provider}] Description:`, description);
+    console.log(`[${provider}] Packaging:`, packaging);
+    console.log(`[${provider}] ========================================`);
+
     return {
       provider,
       unitPrice,
@@ -221,6 +263,165 @@ export async function fetchDigiKeyPrice({ mpn, quantity, currency, packagingPref
     };
   } catch (e: any) {
     console.error(`[${provider}] Error fetching part ${mpn}:`, e.message || e);
+    console.log(`[${provider}] ========================================`);
     return { provider, unitPrice: null, totalCost: null, availability: null, error: e.message || "API Error" };
+  }
+}
+
+export async function fetchDigiKeyStandardized(mpn: string, currency: string = 'INR'): Promise<StandardProviderResult> {
+  const clientId = process.env.DIGIKEY_CLIENT_ID;
+  const clientSecret = process.env.DIGIKEY_CLIENT_SECRET;
+  const provider = "DigiKey";
+
+  const emptyCategories: StandardPackagingCategories = {
+    "Custom Reel / DigiReel": [],
+    "Cut-Tape": [],
+    "Top-reel": []
+  };
+
+  if (!clientId || !clientSecret) {
+    return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
+  }
+
+  try {
+    const accessToken = await getAccessToken(clientId, clientSecret);
+    const localeSite = currency === 'INR' ? 'IN' : currency === 'EUR' ? 'DE' : 'US';
+    const localeLanguage = 'en';
+
+    const useSandbox = process.env.DIGIKEY_USE_SANDBOX === 'true';
+    const searchUrl = useSandbox
+      ? 'https://sandbox-api.digikey.com/products/v4/search/keyword'
+      : 'https://api.digikey.com/products/v4/search/keyword';
+
+    const requestBody = {
+      Keywords: mpn,
+      Limit: 10,
+      Offset: 0,
+    };
+
+    const res = await fetch(searchUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'X-DIGIKEY-Client-Id': clientId,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-DIGIKEY-Locale-Site': localeSite,
+        'X-DIGIKEY-Locale-Language': localeLanguage,
+        'X-DIGIKEY-Locale-Currency': currency,
+        'X-DIGIKEY-Customer-Id': '0',
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!res.ok) {
+      return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
+    }
+
+    const data = await res.json();
+    console.log(`[DigiKey Standardized] Raw API Response:`, JSON.stringify(data, null, 2));
+    
+    if (!data?.Products || data.Products.length === 0) {
+      console.log(`[DigiKey Standardized] No products found in response`);
+      return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
+    }
+
+    console.log(`[DigiKey Standardized] Found ${data.Products.length} products`);
+
+    const categories: StandardPackagingCategories = {
+      "Custom Reel / DigiReel": [],
+      "Cut-Tape": [],
+      "Top-reel": []
+    };
+
+    let mainDescription = "";
+    const alternatePartsSet = new Set<string>();
+    let maxAvailability = 0;
+
+    for (const prod of data.Products) {
+      if (!mainDescription) {
+        const rawDesc = prod.Description;
+        const descStr = typeof rawDesc === 'object' && rawDesc !== null
+          ? (rawDesc.ProductDescription || rawDesc.DetailedDescription || '')
+          : (rawDesc || '');
+        mainDescription = prod.ProductDescription || descStr || "";
+      }
+
+      const qtyAvailable = prod.QuantityAvailable !== undefined ? prod.QuantityAvailable : null;
+      
+      let currentAvail = 0;
+      if (qtyAvailable !== null && qtyAvailable > 0) {
+        currentAvail = qtyAvailable;
+      }
+      if (currentAvail > maxAvailability) {
+        maxAvailability = currentAvail;
+      }
+
+      // DigiKey uses ProductVariations array for different packaging options
+      const productVariations = prod.ProductVariations || [];
+      console.log(`[DigiKey Standardized] Product ${prod.ManufacturerProductNumber} - ProductVariations:`, JSON.stringify(productVariations, null, 2));
+
+      // Process each product variation (different packaging)
+      for (const variation of productVariations) {
+        const packageTypeName = variation.PackageType?.Name?.toLowerCase() || '';
+        const priceBreaks = variation.StandardPricing || [];
+        
+        console.log(`[DigiKey Standardized] Variation PackageType: "${packageTypeName}"`);
+
+        const mappedBreaks: StandardPriceTier[] = priceBreaks.map((pb: any) => ({
+          Qty: pb.BreakQuantity || 0,
+          unit_price: pb.UnitPrice || 0,
+          currency
+        })).filter((b: any) => b.Qty > 0 && b.unit_price > 0);
+
+        if (mappedBreaks.length > 0) {
+          console.log(`[DigiKey Standardized] Price breaks for ${packageTypeName}:`, JSON.stringify(mappedBreaks, null, 2));
+
+          // Map packaging types to categories
+          if (packageTypeName.includes('digi-reel') || packageTypeName.includes('digireel')) {
+            if (categories["Custom Reel / DigiReel"].length === 0) {
+              categories["Custom Reel / DigiReel"] = mappedBreaks;
+              console.log(`[DigiKey Standardized] ✅ Added Digi-Reel pricing: ${mappedBreaks.length} tiers`);
+            }
+          } else if (packageTypeName.includes('cut tape') || packageTypeName.includes('cut-tape') || packageTypeName === 'ct') {
+            if (categories["Cut-Tape"].length === 0) {
+              categories["Cut-Tape"] = mappedBreaks;
+              console.log(`[DigiKey Standardized] ✅ Added Cut-Tape pricing: ${mappedBreaks.length} tiers`);
+            }
+          } else if (packageTypeName.includes('tape & reel') || packageTypeName.includes('tape and reel') || 
+                     packageTypeName.includes('tr') || packageTypeName.includes('reel')) {
+            if (categories["Top-reel"].length === 0) {
+              categories["Top-reel"] = mappedBreaks;
+              console.log(`[DigiKey Standardized] ✅ Added Tape & Reel pricing: ${mappedBreaks.length} tiers`);
+            }
+          }
+        }
+      }
+
+      const altMpn = prod.ManufacturerProductNumber || prod.manufacturerPartNumber;
+      if (altMpn && altMpn.trim() !== mpn) {
+        alternatePartsSet.add(altMpn.trim());
+      }
+      
+      if (prod.AlternatePackaging && Array.isArray(prod.AlternatePackaging)) {
+        prod.AlternatePackaging.forEach((ap: any) => {
+          const aMpn = ap.ManufacturerPartNumber || ap.manufacturerPartNumber;
+          if (aMpn && aMpn.trim() !== mpn) {
+            alternatePartsSet.add(aMpn.trim());
+          }
+        });
+      }
+    }
+
+    return {
+      provider,
+      categories,
+      description: mainDescription,
+      alternateParts: Array.from(alternatePartsSet),
+      availability: maxAvailability
+    };
+
+  } catch (e) {
+    return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
   }
 }

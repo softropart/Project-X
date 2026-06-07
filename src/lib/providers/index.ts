@@ -23,3 +23,40 @@ export interface ProviderRequest {
   currency: string;
   packagingPreference?: 'Any' | 'Cut Tape' | 'Reel';
 }
+
+export interface StandardPriceTier {
+  Qty: number;
+  unit_price: number;
+  currency: string;
+}
+
+export interface StandardPackagingCategories {
+  "Custom Reel / DigiReel": StandardPriceTier[];
+  "Cut-Tape": StandardPriceTier[];
+  "Top-reel": StandardPriceTier[];
+}
+
+export interface StandardDistributorData {
+  availability: number;
+  packaging: StandardPackagingCategories;
+}
+
+export interface StandardProviderResult {
+  provider: string;
+  categories: StandardPackagingCategories;
+  description: string;
+  alternateParts: string[];
+  availability: number;
+}
+
+export interface StandardPartData {
+  [mpn: string]: {
+    description: string;
+    alias_part_numbers: string[];
+    pricing_by_distributor: {
+      DigiKey: StandardDistributorData;
+      Mouser: StandardDistributorData;
+      Element14: StandardDistributorData;
+    };
+  };
+}

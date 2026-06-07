@@ -1,4 +1,4 @@
-import { ProviderPriceResult, ProviderRequest, PriceBreak } from './index';
+import { ProviderPriceResult, ProviderRequest, PriceBreak, StandardProviderResult, StandardPackagingCategories, StandardPriceTier } from './index';
 
 const EXCHANGE_RATES: Record<string, number> = {
   USD: 1.0,
@@ -131,5 +131,100 @@ export async function fetchElement14Price({ mpn, quantity, currency, packagingPr
   } catch (e: any) {
     console.error(`[${provider}] Error fetching part ${mpn}:`, e.message || e);
     return { provider, unitPrice: null, totalCost: null, availability: null, error: e.message || "API Error" };
+  }
+}
+
+export async function fetchElement14Standardized(mpn: string, currency: string = 'INR'): Promise<StandardProviderResult> {
+  const apiKey = process.env.ELEMENT14_API_KEY;
+  const provider = "Element14";
+
+  const emptyCategories: StandardPackagingCategories = {
+    "Custom Reel / DigiReel": [],
+    "Cut-Tape": [],
+    "Top-reel": []
+  };
+
+  if (!apiKey) {
+    return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
+  }
+
+  try {
+    const storeId = currency === 'INR' ? 'in.element14.com' : currency === 'EUR' ? 'uk.farnell.com' : 'www.newark.com';
+    const storeCurrency = storeId === 'in.element14.com' ? 'INR' : storeId === 'uk.farnell.com' ? 'EUR' : 'USD';
+
+    const url = `https://api.element14.com/catalog/products?term=manuPartNum%3A${encodeURIComponent(mpn)}&resultsSettings.offset=0&resultsSettings.responseGroup=large&storeInfo.id=${storeId}&resultsSettings.numberOfResults=10&resultsSettings.refinements.filters=inStock&callInfo.omitXmlSchema=false&callInfo.responseDataFormat=json&callinfo.apiKey=${apiKey}`;
+
+    const res = await fetch(url, { method: 'GET' });
+
+    if (!res.ok) {
+      return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
+    }
+
+    const data = await res.json();
+    const numberOfResults = data?.manufacturerPartNumberSearchReturn?.numberOfResults || 0;
+
+    if (numberOfResults === 0 || !data?.manufacturerPartNumberSearchReturn?.products) {
+      return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
+    }
+
+    const products = data.manufacturerPartNumberSearchReturn.products;
+
+    const categories: StandardPackagingCategories = {
+      "Custom Reel / DigiReel": [],
+      "Cut-Tape": [],
+      "Top-reel": []
+    };
+
+    let mainDescription = "";
+    const alternatePartsSet = new Set<string>();
+    let maxAvailability = 0;
+
+    for (const prod of products) {
+      if (!mainDescription) {
+        mainDescription = prod.displayName || prod.description || "";
+      }
+
+      const currentAvail = prod.stock?.level || prod.inventoryCode || 0;
+      if (currentAvail > maxAvailability) {
+        maxAvailability = currentAvail;
+      }
+
+      const descVal = String(prod.displayName || prod.description || '').toLowerCase();
+      const packagingVal = String(prod.packagingCode || '').toLowerCase();
+      
+      const isCustomReel = descVal.includes('custom reel') || packagingVal.includes('cr');
+      const isTopReel = descVal.includes('reel') || descVal.includes('tr') || descVal.includes('tape & reel');
+      const isCutTape = descVal.includes('cut tape') || descVal.includes('ct') || descVal.includes('strip') || descVal.includes('bag') || descVal.includes('tube') || descVal.includes('tray') || descVal.includes('bulk');
+
+      const prices = prod.prices || [];
+      const mappedBreaks: StandardPriceTier[] = prices.map((p: any) => ({
+        Qty: p.from || 0,
+        unit_price: convertCurrency(p.cost || 0, storeCurrency, currency),
+        currency
+      })).filter((b: any) => b.Qty > 0 && b.unit_price > 0);
+
+      if (isCustomReel && categories["Custom Reel / DigiReel"].length === 0) {
+        categories["Custom Reel / DigiReel"] = mappedBreaks;
+      } else if (isCutTape && categories["Cut-Tape"].length === 0) {
+        categories["Cut-Tape"] = mappedBreaks;
+      } else if (isTopReel && categories["Top-reel"].length === 0) {
+        categories["Top-reel"] = mappedBreaks;
+      }
+
+      if (prod.rohsSubstitute && prod.rohsSubstitute.trim() !== mpn) {
+        alternatePartsSet.add(prod.rohsSubstitute.trim());
+      }
+    }
+
+    return {
+      provider,
+      categories,
+      description: mainDescription,
+      alternateParts: Array.from(alternatePartsSet),
+      availability: maxAvailability
+    };
+
+  } catch (e) {
+    return { provider, categories: emptyCategories, description: "", alternateParts: [], availability: 0 };
   }
 }
