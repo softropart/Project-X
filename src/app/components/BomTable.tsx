@@ -32,7 +32,6 @@ interface BomItemState extends ParsedBomItem {
   alternateParts?: string[];
   suggestedQty?: number | null;
   suggestedSavings?: number | null;
-  alternateParts?: string[];
 }
 
 const CURRENCIES = [
